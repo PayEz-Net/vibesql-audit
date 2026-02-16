@@ -94,7 +94,9 @@ BEGIN
 
     FOR rec IN
         SELECT id, event_hash, prev_hash,
-               event_type || '|' || event_time::TEXT || '|' || COALESCE(session_user, '') ||
+               event_type || '|' ||
+               to_char(event_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') || '|' ||
+               COALESCE(session_user, '') ||
                '|' || COALESCE(database, '') || '|' || COALESCE(command_tag, '') ||
                '|' || COALESCE(query_text, '') AS event_payload
         FROM vibe_audit.events

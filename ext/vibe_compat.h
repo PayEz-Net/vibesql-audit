@@ -75,6 +75,7 @@ extern char *vibe_audit_executor_mode;
 extern void vibe_emit_event(const char *json, int len);
 extern void vibe_emit_auth_event(Port *port, int status);
 extern void vibe_emit_utility_event(VIBE_UTILITY_HOOK_ARGS);
+extern void vibe_emit_utility_event_with_status(VIBE_UTILITY_HOOK_ARGS, bool success);
 extern void vibe_emit_executor_event(QueryDesc *queryDesc);
 
 #endif

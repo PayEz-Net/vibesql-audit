@@ -57,7 +57,7 @@ async fn main() {
         "vibe-audit-forwarder starting"
     );
 
-    let gelf_forwarder = Arc::new(gelf::GelfForwarder::new(&gelf_host, gelf_port));
+    let gelf_forwarder = Arc::new(gelf::GelfForwarder::new(&gelf_host, gelf_port).await);
     let batch_writer = Arc::new(writer::BatchWriter::new(&db_url).await);
     let health_state = HealthState::new();
 
@@ -147,7 +147,7 @@ async fn main() {
                     let event_time = event["event_time"].as_str().map(|s| s.to_string());
                     state_ref.update(chain.chain_length(), event_time);
 
-                    gelf_ref.send(&event);
+                    gelf_ref.send(&event).await;
                     batch.push(event);
 
                     if batch.len() >= 100 {

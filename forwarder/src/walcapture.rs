@@ -178,45 +178,29 @@ struct ParsedColumn {
 fn parse_change_line(data: &str) -> Option<(String, String, String, Vec<ParsedColumn>)> {
     let data = data.trim();
 
-    let (command, rest) = if data.starts_with("table ") {
-        ("UPDATE".to_string(), data)
-    } else {
-        let space = data.find(' ')?;
-        let cmd = data[..space].to_string();
-        (cmd, &data[space + 1..])
-    };
+    if !data.starts_with("table ") {
+        return None;
+    }
 
-    let command_tag = if rest.starts_with("table ") {
-        let after = &rest[6..];
-        let colon = after.find(':')?;
-        let full_table = &after[..colon];
+    let after_table = &data[6..];
+    let first_colon = after_table.find(':')?;
+    let full_table = after_table[..first_colon].trim();
 
-        let (schema, table) = if let Some(dot) = full_table.find('.') {
-            (full_table[..dot].to_string(), full_table[dot + 1..].to_string())
-        } else {
-            ("public".to_string(), full_table.to_string())
-        };
+    let after_first_colon = after_table[first_colon + 1..].trim();
+    let second_colon = after_first_colon.find(':')?;
+    let command = after_first_colon[..second_colon].trim().to_string();
 
-        let col_data = after[colon + 1..].trim();
-        let columns = parse_column_values(col_data);
+    let col_data = after_first_colon[second_colon + 1..].trim();
 
-        return Some((command, schema, table, columns));
-    } else {
-        command
-    };
-
-    let colon = rest.find(':')?;
-    let full_table = rest[..colon].trim();
     let (schema, table) = if let Some(dot) = full_table.find('.') {
         (full_table[..dot].to_string(), full_table[dot + 1..].to_string())
     } else {
         ("public".to_string(), full_table.to_string())
     };
 
-    let col_data = rest[colon + 1..].trim();
     let columns = parse_column_values(col_data);
 
-    Some((command_tag, schema, table, columns))
+    Some((command, schema, table, columns))
 }
 
 fn parse_column_values(data: &str) -> Vec<ParsedColumn> {
@@ -247,13 +231,24 @@ fn parse_column_values(data: &str) -> Vec<ParsedColumn> {
                 let mut value = rest_of_col[colon_pos + 1..].to_string();
 
                 if value.starts_with('\'') {
-                    value = value.trim_start_matches('\'').to_string();
-                    while !value.ends_with('\'') && i + 1 < parts.len() {
+                    value = value[1..].to_string();
+                    loop {
+                        if value.ends_with('\'') {
+                            let trimmed = &value[..value.len() - 1];
+                            if !trimmed.ends_with('\'') {
+                                value = trimmed.to_string();
+                                break;
+                            }
+                        }
+                        if i + 1 >= parts.len() {
+                            value = value.trim_end_matches('\'').to_string();
+                            break;
+                        }
                         i += 1;
                         value.push(' ');
                         value.push_str(parts[i]);
                     }
-                    value = value.trim_end_matches('\'').to_string();
+                    value = value.replace("''", "'");
                 }
 
                 columns.push(ParsedColumn {
@@ -358,10 +353,43 @@ mod tests {
     fn test_parse_insert_line() {
         let line = "table public.users: INSERT: id[integer]:1 data[jsonb]:'{\"name\": \"Alice\"}'";
         let (cmd, schema, table, cols) = parse_change_line(line).unwrap();
-        assert_eq!(cmd, "UPDATE");
+        assert_eq!(cmd, "INSERT");
         assert_eq!(schema, "public");
         assert_eq!(table, "users");
         assert!(!cols.is_empty());
+    }
+
+    #[test]
+    fn test_parse_update_line() {
+        let line = "table collections.orders: UPDATE: id[integer]:5 data[jsonb]:'{\"total\": 100}'";
+        let (cmd, schema, table, _) = parse_change_line(line).unwrap();
+        assert_eq!(cmd, "UPDATE");
+        assert_eq!(schema, "collections");
+        assert_eq!(table, "orders");
+    }
+
+    #[test]
+    fn test_parse_delete_line() {
+        let line = "table public.users: DELETE: id[integer]:1";
+        let (cmd, schema, table, _) = parse_change_line(line).unwrap();
+        assert_eq!(cmd, "DELETE");
+        assert_eq!(schema, "public");
+        assert_eq!(table, "users");
+    }
+
+    #[test]
+    fn test_parse_begin_commit_skipped() {
+        assert!(parse_change_line("BEGIN 12345").is_none());
+        assert!(parse_change_line("COMMIT 12345").is_none());
+    }
+
+    #[test]
+    fn test_parse_escaped_single_quotes() {
+        let line = "table public.users: INSERT: id[integer]:1 name[text]:'O''Brien'";
+        let (cmd, _, _, cols) = parse_change_line(line).unwrap();
+        assert_eq!(cmd, "INSERT");
+        let name_col = cols.iter().find(|c| c.name == "name").unwrap();
+        assert_eq!(name_col.value, "O'Brien");
     }
 
     #[test]

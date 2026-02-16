@@ -144,13 +144,25 @@ vibe_client_auth_hook(Port *port, int status)
 static void
 vibe_process_utility_hook(VIBE_UTILITY_HOOK_ARGS)
 {
-    if (vibe_audit_enabled)
-        vibe_emit_utility_event(VIBE_UTILITY_HOOK_PASSTHROUGH);
+    bool emit = vibe_audit_enabled;
 
-    if (prev_process_utility_hook)
-        prev_process_utility_hook(VIBE_UTILITY_HOOK_PASSTHROUGH);
-    else
-        standard_ProcessUtility(VIBE_UTILITY_HOOK_PASSTHROUGH);
+    PG_TRY();
+    {
+        if (prev_process_utility_hook)
+            prev_process_utility_hook(VIBE_UTILITY_HOOK_PASSTHROUGH);
+        else
+            standard_ProcessUtility(VIBE_UTILITY_HOOK_PASSTHROUGH);
+    }
+    PG_CATCH();
+    {
+        if (emit)
+            vibe_emit_utility_event_with_status(VIBE_UTILITY_HOOK_PASSTHROUGH, false);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
+    if (emit)
+        vibe_emit_utility_event(VIBE_UTILITY_HOOK_PASSTHROUGH);
 }
 
 static void

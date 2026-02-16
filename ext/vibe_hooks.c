@@ -108,6 +108,12 @@ vibe_emit_auth_event(Port *port, int status)
 void
 vibe_emit_utility_event(VIBE_UTILITY_HOOK_ARGS)
 {
+    vibe_emit_utility_event_with_status(VIBE_UTILITY_HOOK_PASSTHROUGH, true);
+}
+
+void
+vibe_emit_utility_event_with_status(VIBE_UTILITY_HOOK_ARGS, bool success)
+{
     Node *utility_stmt;
     const char *ddl_tag;
     char buf[VIBE_MAX_EVENT_SIZE];
@@ -190,7 +196,7 @@ vibe_emit_utility_event(VIBE_UTILITY_HOOK_ARGS)
         "{"
         "\"event_type\":\"DDL\","
         "\"event_time\":\"%s\","
-        "\"success\":true,"
+        "\"success\":%s,"
         "\"session_user\":\"%s\","
         "\"client_addr\":\"\","
         "\"client_port\":0,"
@@ -206,6 +212,7 @@ vibe_emit_utility_event(VIBE_UTILITY_HOOK_ARGS)
         "\"detail\":null"
         "}",
         timebuf,
+        success ? "true" : "false",
         GetUserNameFromId(GetUserId(), false),
         get_database_name(MyDatabaseId),
         MyProcPid,

@@ -115,6 +115,11 @@ pub async fn heartbeat_loop(
     loop {
         interval.tick().await;
 
+        let (events_processed, chain_length) = {
+            let data = state.inner.lock().unwrap();
+            (data.events_processed, data.chain_length)
+        };
+
         let event = serde_json::json!({
             "event_type": "SYSTEM_EVENT",
             "event_time": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
@@ -133,11 +138,11 @@ pub async fn heartbeat_loop(
             "sqlstate": null,
             "detail": {
                 "type": "heartbeat",
-                "events_processed": state.inner.lock().unwrap().events_processed,
-                "chain_length": state.inner.lock().unwrap().chain_length
+                "events_processed": events_processed,
+                "chain_length": chain_length
             }
         });
 
-        gelf.send(&event);
+        gelf.send(&event).await;
     }
 }

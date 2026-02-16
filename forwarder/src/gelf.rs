@@ -2,21 +2,25 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde_json::{json, Value};
 use std::io::Write;
-use std::net::UdpSocket;
+use std::net::SocketAddr;
+use tokio::net::UdpSocket;
 use tracing::{debug, error};
 
 pub struct GelfForwarder {
     socket: UdpSocket,
-    target: String,
+    target: SocketAddr,
     hostname: String,
 }
 
 impl GelfForwarder {
-    pub fn new(host: &str, port: u16) -> Self {
-        let socket = UdpSocket::bind("0.0.0.0:0").expect("failed to bind GELF UDP socket");
-        socket
-            .set_nonblocking(true)
-            .expect("failed to set non-blocking");
+    pub async fn new(host: &str, port: u16) -> Self {
+        let socket = UdpSocket::bind("0.0.0.0:0")
+            .await
+            .expect("failed to bind GELF UDP socket");
+
+        let target: SocketAddr = format!("{}:{}", host, port)
+            .parse()
+            .expect("invalid GELF target address");
 
         let hostname = hostname::get()
             .map(|h| h.to_string_lossy().to_string())
@@ -24,12 +28,12 @@ impl GelfForwarder {
 
         Self {
             socket,
-            target: format!("{}:{}", host, port),
+            target,
             hostname,
         }
     }
 
-    pub fn send(&self, event: &Value) {
+    pub async fn send(&self, event: &Value) {
         let gelf = self.to_gelf(event);
 
         let json_bytes = match serde_json::to_vec(&gelf) {
@@ -54,7 +58,7 @@ impl GelfForwarder {
             }
         };
 
-        match self.socket.send_to(&compressed, &self.target) {
+        match self.socket.send_to(&compressed, &self.target).await {
             Ok(_) => debug!("GELF sent to {}", self.target),
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::WouldBlock {

@@ -19,7 +19,7 @@ services:
   forwarder:
     build:
       context: ..
-      dockerfile: deploy/Dockerfile.forwarder
+      dockerfile: deploy/Dockerfile
     environment:
       VIBE_AUDIT_UDP_PORT: "5514"
       VIBE_AUDIT_DB_URL: "postgresql://postgres:postgres@postgres:5432/vibesql"
@@ -30,7 +30,6 @@ services:
       - "9100:9100"
     depends_on:
       - postgres
-    network_mode: "service:postgres"
 
   graylog:
     image: graylog/graylog:6.1

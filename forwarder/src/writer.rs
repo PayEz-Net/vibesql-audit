@@ -1,10 +1,11 @@
 use deadpool_postgres::{Config, Pool, Runtime};
 use serde_json::Value;
 use tokio_postgres::NoTls;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub struct BatchWriter {
     pool: Pool,
+    retry_queue: tokio::sync::Mutex<Vec<Value>>,
 }
 
 impl BatchWriter {
@@ -19,7 +20,10 @@ impl BatchWriter {
             .create_pool(Some(Runtime::Tokio1), NoTls)
             .expect("failed to create database pool");
 
-        let writer = Self { pool };
+        let writer = Self {
+            pool,
+            retry_queue: tokio::sync::Mutex::new(Vec::new()),
+        };
         writer.ensure_partition().await;
         writer
     }
@@ -44,86 +48,128 @@ impl BatchWriter {
             return;
         }
 
+        let mut retries = {
+            let mut q = self.retry_queue.lock().await;
+            std::mem::take(&mut *q)
+        };
+
+        let all_events: Vec<&Value> = retries.iter().chain(events.iter()).collect();
+
         let client = match self.pool.get().await {
             Ok(c) => c,
             Err(e) => {
                 error!("failed to get db connection: {}", e);
+                self.enqueue_retries(events).await;
                 return;
             }
         };
 
-        let stmt = "INSERT INTO vibe_audit.events \
+        let mut query = String::from(
+            "INSERT INTO vibe_audit.events \
             (event_type, event_time, success, session_user, client_addr, client_port, \
              database, pid, application, command_tag, object_type, object_name, \
-             schema_name, query_text, sqlstate, detail, prev_hash, event_hash) \
-            VALUES ($1, $2::timestamptz, $3, $4, $5::inet, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb, $17, $18)";
+             schema_name, query_text, sqlstate, detail, prev_hash, event_hash) VALUES "
+        );
 
-        let prepared = match client.prepare(stmt).await {
-            Ok(s) => s,
-            Err(e) => {
-                error!("failed to prepare insert: {}", e);
-                return;
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        let mut param_idx = 1u32;
+
+        for (i, event) in all_events.iter().enumerate() {
+            if i > 0 {
+                query.push_str(", ");
             }
-        };
+            query.push_str(&format!(
+                "(${}, ${}::timestamptz, ${}, ${}, ${}::inet, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}::jsonb, ${}, ${})",
+                param_idx, param_idx + 1, param_idx + 2, param_idx + 3,
+                param_idx + 4, param_idx + 5, param_idx + 6, param_idx + 7,
+                param_idx + 8, param_idx + 9, param_idx + 10, param_idx + 11,
+                param_idx + 12, param_idx + 13, param_idx + 14, param_idx + 15,
+                param_idx + 16, param_idx + 17
+            ));
+            param_idx += 18;
 
-        for event in events {
-            let event_type = event["event_type"].as_str().unwrap_or("UNKNOWN");
-            let event_time = event["event_time"].as_str().unwrap_or("1970-01-01T00:00:00Z");
+            let event_type = str_val(&event["event_type"]).unwrap_or_else(|| "UNKNOWN".to_string());
+            let event_time = str_val(&event["event_time"]).unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
             let success = event["success"].as_bool().unwrap_or(false);
-            let session_user = str_or_null(&event["session_user"]);
-            let client_addr = str_or_null(&event["client_addr"]);
+            let session_user = str_val(&event["session_user"]);
+            let client_addr = str_val(&event["client_addr"]);
             let client_port = event["client_port"].as_i64().map(|v| v as i32);
-            let database = str_or_null(&event["database"]);
+            let database = str_val(&event["database"]);
             let pid = event["pid"].as_i64().map(|v| v as i32);
-            let application = str_or_null(&event["application"]);
-            let command_tag = str_or_null(&event["command_tag"]);
-            let object_type = str_or_null(&event["object_type"]);
-            let object_name = str_or_null(&event["object_name"]);
-            let schema_name = str_or_null(&event["schema_name"]);
-            let query_text = str_or_null(&event["query_text"]);
-            let sqlstate = str_or_null(&event["sqlstate"]);
-            let detail = if event["detail"].is_null() {
+            let application = str_val(&event["application"]);
+            let command_tag = str_val(&event["command_tag"]);
+            let object_type = str_val(&event["object_type"]);
+            let object_name = str_val(&event["object_name"]);
+            let schema_name = str_val(&event["schema_name"]);
+            let query_text = str_val(&event["query_text"]);
+            let sqlstate = str_val(&event["sqlstate"]);
+            let detail: Option<String> = if event["detail"].is_null() {
                 None
             } else {
                 Some(event["detail"].to_string())
             };
-            let prev_hash = str_or_null(&event["prev_hash"]);
-            let event_hash = str_or_null(&event["event_hash"]);
+            let prev_hash = str_val(&event["prev_hash"]);
+            let event_hash = str_val(&event["event_hash"]);
 
-            if let Err(e) = client
-                .execute(
-                    &prepared,
-                    &[
-                        &event_type,
-                        &event_time,
-                        &success,
-                        &session_user,
-                        &client_addr,
-                        &client_port,
-                        &database,
-                        &pid,
-                        &application,
-                        &command_tag,
-                        &object_type,
-                        &object_name,
-                        &schema_name,
-                        &query_text,
-                        &sqlstate,
-                        &detail,
-                        &prev_hash,
-                        &event_hash,
-                    ],
-                )
-                .await
-            {
-                error!("failed to insert audit event: {}", e);
-            }
+            params.push(Box::new(event_type));
+            params.push(Box::new(event_time));
+            params.push(Box::new(success));
+            params.push(Box::new(session_user));
+            params.push(Box::new(client_addr));
+            params.push(Box::new(client_port));
+            params.push(Box::new(database));
+            params.push(Box::new(pid));
+            params.push(Box::new(application));
+            params.push(Box::new(command_tag));
+            params.push(Box::new(object_type));
+            params.push(Box::new(object_name));
+            params.push(Box::new(schema_name));
+            params.push(Box::new(query_text));
+            params.push(Box::new(sqlstate));
+            params.push(Box::new(detail));
+            params.push(Box::new(prev_hash));
+            params.push(Box::new(event_hash));
         }
 
-        info!("wrote batch of {} events", events.len());
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+
+        match client.execute(&query as &str, &param_refs).await {
+            Ok(_) => {
+                let total = all_events.len();
+                let retry_count = retries.len();
+                if retry_count > 0 {
+                    info!(total, retried = retry_count, "wrote batch with retries");
+                } else {
+                    info!(total, "wrote batch of events");
+                }
+                retries.clear();
+            }
+            Err(e) => {
+                error!("batch insert failed: {}, queuing {} events for retry", e, all_events.len());
+                self.enqueue_retries(events).await;
+                let mut q = self.retry_queue.lock().await;
+                q.extend(retries);
+            }
+        }
+    }
+
+    async fn enqueue_retries(&self, events: &[Value]) {
+        let mut q = self.retry_queue.lock().await;
+        let max_retry = 10_000;
+        for event in events {
+            if q.len() >= max_retry {
+                warn!("retry queue full ({} events), dropping oldest", max_retry);
+                q.remove(0);
+            }
+            q.push(event.clone());
+        }
+        if !events.is_empty() {
+            warn!(queued = q.len(), "events queued for retry");
+        }
     }
 }
 
-fn str_or_null(v: &Value) -> Option<String> {
+fn str_val(v: &Value) -> Option<String> {
     v.as_str().map(|s| s.to_string())
 }

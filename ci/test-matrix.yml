@@ -40,9 +40,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build forwarder
-        working-directory: forwarder
+        working-directory: vibesql-audit/forwarder
         run: cargo build --release
 
       - name: Run tests
-        working-directory: forwarder
+        working-directory: vibesql-audit/forwarder
         run: cargo test
