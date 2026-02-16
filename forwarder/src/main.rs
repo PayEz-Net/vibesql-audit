@@ -42,7 +42,6 @@ async fn main() {
 
     let wal_enabled = env_bool("VIBE_AUDIT_WAL_ENABLED", true);
     let wal_slot = env_or("VIBE_AUDIT_WAL_SLOT", "vibe_audit_slot");
-    let wal_publication = env_or("VIBE_AUDIT_WAL_PUBLICATION", "vibe_audit_pub");
     let sensitive_fields_csv = env_or("VIBE_AUDIT_SENSITIVE_FIELDS", "");
 
     info!(
@@ -53,7 +52,6 @@ async fn main() {
         health_port,
         wal_enabled,
         %wal_slot,
-        %wal_publication,
         "vibe-audit-forwarder starting"
     );
 

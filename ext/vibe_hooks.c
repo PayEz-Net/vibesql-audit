@@ -1,5 +1,67 @@
 #include "vibe_compat.h"
 
+static int
+vibe_json_escape(char *dst, size_t dst_size, const char *src)
+{
+    size_t di = 0;
+    size_t si;
+
+    if (!src)
+    {
+        if (dst_size > 0)
+            dst[0] = '\0';
+        return 0;
+    }
+
+    for (si = 0; src[si] != '\0' && di + 1 < dst_size; si++)
+    {
+        char c = src[si];
+        switch (c)
+        {
+            case '"':
+            case '\\':
+                if (di + 2 >= dst_size) goto done;
+                dst[di++] = '\\';
+                dst[di++] = c;
+                break;
+            case '\n':
+                if (di + 2 >= dst_size) goto done;
+                dst[di++] = '\\';
+                dst[di++] = 'n';
+                break;
+            case '\r':
+                if (di + 2 >= dst_size) goto done;
+                dst[di++] = '\\';
+                dst[di++] = 'r';
+                break;
+            case '\t':
+                if (di + 2 >= dst_size) goto done;
+                dst[di++] = '\\';
+                dst[di++] = 't';
+                break;
+            default:
+                if ((unsigned char)c < 0x20)
+                {
+                    if (di + 6 >= dst_size) goto done;
+                    di += snprintf(dst + di, dst_size - di, "\\u%04x", (unsigned char)c);
+                }
+                else
+                {
+                    dst[di++] = c;
+                }
+                break;
+        }
+    }
+
+done:
+    if (di < dst_size)
+        dst[di] = '\0';
+    else if (dst_size > 0)
+        dst[dst_size - 1] = '\0';
+
+    return (int)di;
+}
+
 static const char *
 vibe_node_tag_to_ddl(NodeTag tag)
 {
@@ -185,6 +247,9 @@ vibe_emit_utility_event_with_status(VIBE_UTILITY_HOOK_ARGS, bool success)
             break;
     }
 
+    char escaped_query[VIBE_MAX_EVENT_SIZE / 2];
+    vibe_json_escape(escaped_query, sizeof(escaped_query), queryString);
+
     gettimeofday(&tv, NULL);
     tm_info = gmtime(&tv.tv_sec);
     snprintf(timebuf, sizeof(timebuf), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
@@ -221,7 +286,7 @@ vibe_emit_utility_event_with_status(VIBE_UTILITY_HOOK_ARGS, bool success)
         object_type ? "\"" : "null", object_type ? object_type : "", object_type ? "\"" : "",
         object_name ? "\"" : "null", object_name ? object_name : "", object_name ? "\"" : "",
         schema_name ? "\"" : "null", schema_name ? schema_name : "", schema_name ? "\"" : "",
-        queryString ? queryString : ""
+        escaped_query
     );
 
     if (len > 0 && len < (int)sizeof(buf))
@@ -235,13 +300,13 @@ vibe_emit_executor_event(QueryDesc *queryDesc)
     struct timeval tv;
     struct tm *tm_info;
     char timebuf[64];
-    const char *query_text;
     const char *cmd_tag;
+    char escaped_query[VIBE_MAX_EVENT_SIZE / 2];
 
     if (!queryDesc || !queryDesc->sourceText)
         return;
 
-    query_text = queryDesc->sourceText;
+    vibe_json_escape(escaped_query, sizeof(escaped_query), queryDesc->sourceText);
 
     switch (queryDesc->operation)
     {
@@ -284,7 +349,7 @@ vibe_emit_executor_event(QueryDesc *queryDesc)
         MyProcPid,
         application_name ? application_name : "",
         cmd_tag,
-        query_text
+        escaped_query
     );
 
     if (len > 0 && len < (int)sizeof(buf))

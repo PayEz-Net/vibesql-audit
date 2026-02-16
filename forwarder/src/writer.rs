@@ -147,9 +147,18 @@ impl BatchWriter {
             }
             Err(e) => {
                 error!("batch insert failed: {}, queuing {} events for retry", e, all_events.len());
-                self.enqueue_retries(events).await;
                 let mut q = self.retry_queue.lock().await;
-                q.extend(retries);
+                let max_retry = 10_000;
+                for event in retries.into_iter().chain(events.iter().cloned()) {
+                    if q.len() >= max_retry {
+                        warn!("retry queue full ({} events), dropping oldest", max_retry);
+                        q.remove(0);
+                    }
+                    q.push(event);
+                }
+                if !q.is_empty() {
+                    warn!(queued = q.len(), "events queued for retry");
+                }
             }
         }
     }
