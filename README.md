@@ -1,69 +1,61 @@
 # VibeSQL Audit
 
-**Compliance-grade PostgreSQL audit logging with tamper-evident hash chains.**
+**PostgreSQL extension for PCI DSS compliant audit logging.**
 
-VibeSQL Audit is a PostgreSQL C extension paired with a Rust sidecar forwarder. Together they provide PCI DSS SAQ-D compliant audit logging: authentication tracking, DDL capture, privilege change monitoring, and a SHA-256 hash chain for tamper evidence — all without blocking database transactions.
+A native C extension with three hooks, WAL-based change capture, and a Rust sidecar forwarder. Tamper-evident SHA-256 hash chains, append-only storage, JSONB field-level diffing, and GELF forwarding to your SIEM — without blocking database transactions.
 
-This is not a fork of pgAudit. It's built from scratch for PCI compliance with a decoupled emission architecture: thin C hooks emit events over UDP on loopback, and a sidecar forwarder handles hash chaining, batch persistence, and GELF forwarding.
+This is not a fork of pgAudit. Built from scratch for PCI DSS v4.0 SAQ-D compliance with a decoupled emission architecture.
 
 ---
 
-## What It Does
+## How It Works
 
 ```
-PostgreSQL Backend Process
+PostgreSQL
   │
   ├─ ClientAuthentication_hook ──┐
-  ├─ ProcessUtility_hook ────────┤  UDP (non-blocking)
-  ├─ ExecutorEnd_hook ───────────┤  127.0.0.1:5514
+  ├─ ProcessUtility_hook ────────┤  UDP 127.0.0.1:5514
+  ├─ ExecutorEnd_hook ───────────┤  (non-blocking)
+  │                              │
+  │  WAL logical decoding ───────┤  DML_CHANGE events
+  │  (test_decoding plugin)      │  JSONB field diffing
   │                              │
   │                              ▼
-  │                   ┌──────────────────┐
-  │                   │  Forwarder       │
-  │                   │  (Rust sidecar)  │
-  │                   │                  │
-  │                   │  ┌─ Hash Chain ──┤──▶ SHA-256 chain
-  │                   │  ├─ Batch Write ─┤──▶ vibe_audit.events (append-only)
-  │                   │  └─ GELF Forward─┤──▶ Graylog / SIEM
-  │                   │                  │
-  │                   │  /health ────────┤──▶ Monitoring
-  │                   │  heartbeat ──────┤──▶ Liveness (10s)
-  │                   └──────────────────┘
+  │                   ┌──────────────────────┐
+  │                   │  vibe-audit-forwarder │
+  │                   │  (Rust sidecar)       │
+  │                   │                       │
+  │                   │  ├─ Hash Chain ───────┤──▶ SHA-256 tamper evidence
+  │                   │  ├─ Batch Insert ─────┤──▶ vibe_audit.events
+  │                   │  ├─ JSONB Diffing ────┤──▶ Sensitive field tracking
+  │                   │  ├─ GELF Forward ─────┤──▶ Graylog / SIEM
+  │                   │  └─ Heartbeat (10s) ──┤──▶ Liveness canary
+  │                   │                       │
+  │                   │  :9100/health ────────┤──▶ Monitoring
+  │                   └───────────────────────┘
   │
   └─ Normal query processing (never blocked)
 ```
 
-1. PostgreSQL hooks capture auth, DDL, and DML events
-2. Events are serialized to JSON and sent over UDP to loopback (non-blocking, never stalls the backend)
-3. The forwarder receives events, computes a SHA-256 hash chain linking each event to its predecessor
-4. Events are batch-inserted into the append-only `vibe_audit.events` table (partitioned by month)
-5. Each event is forwarded to Graylog via GELF for real-time alerting
-6. A heartbeat every 10 seconds proves the audit pipeline is alive
+**Two capture methods:**
+
+1. **C hooks** — Auth events, DDL, privilege changes, DML access by superusers. Emit via UDP on loopback. Zero impact on transaction latency.
+2. **WAL logical decoding** — Full DML change stream with before/after JSONB document visibility. Captures what hooks cannot: the actual data that changed inside JSONB columns. Uses the standard `test_decoding` output plugin.
 
 ---
 
-## Key Features
+## Extension Details
 
-**Non-Blocking Emission**
-The C extension uses UDP `sendto()` on loopback. If the forwarder is overwhelmed, events are silently dropped — the database transaction is never blocked. After 10 consecutive failures, the extension falls back to PostgreSQL `elog(LOG)`.
+```
+Name:       vibe_audit
+Version:    1.1
+Schema:     vibe_audit
+Relocatable: no
+License:    Apache 2.0
+PostgreSQL: 15, 16, 17
+```
 
-**SHA-256 Hash Chain**
-Every event includes `prev_hash` and `event_hash`. Each hash is computed as `SHA256(prev_hash || event_payload)`. Tampering with any event breaks the chain. Verify integrity with `SELECT * FROM vibe_audit.verify_chain()`.
-
-**Append-Only Storage**
-`UPDATE` and `DELETE` are revoked on `vibe_audit.events`. Monthly partitions are auto-created by the forwarder on startup and daily thereafter.
-
-**GELF Forwarding**
-Every event is forwarded to Graylog (or any GELF-compatible endpoint) for real-time dashboards and alerting.
-
-**Multi-Version Support**
-Built and tested against PostgreSQL 15, 16, and 17. Version guards (`PG_VERSION_NUM`) handle hook signature differences.
-
----
-
-## Quick Start
-
-### 1. Build the Extension
+### Installation
 
 ```bash
 cd ext/
@@ -71,51 +63,64 @@ make PG_CONFIG=/usr/bin/pg_config
 sudo make install
 ```
 
-### 2. Configure PostgreSQL
+### PostgreSQL Configuration
 
-```
+```ini
 # postgresql.conf
+
+# Required
 shared_preload_libraries = 'vibe_audit'
+
+# Extension settings
 vibe_audit.enabled = on
 vibe_audit.udp_port = 5514
 vibe_audit.udp_host = '127.0.0.1'
+vibe_audit.executor_mode = 'emit'    # emit | counter | off
+
+# Required for WAL capture (DML change tracking)
+wal_level = logical
+max_replication_slots = 4
 ```
 
-Restart PostgreSQL after changing `shared_preload_libraries`.
+Restart PostgreSQL after changing `shared_preload_libraries` or `wal_level`.
 
-### 3. Create the Extension
+### Create Extension
 
 ```sql
 CREATE EXTENSION vibe_audit;
 ```
 
-### 4. Build and Run the Forwarder
+This creates the `vibe_audit` schema with:
+- `events` — Partitioned append-only audit log (monthly partitions)
+- `sensitive_tables` — Registry for tables requiring audit
+- `sensitive_fields` — Registry for JSONB fields with redaction control
+- `ensure_partition()` — Auto-creates monthly partitions
+- `verify_chain()` — Validates SHA-256 hash chain integrity
+
+### WAL Replication Slot
+
+```sql
+-- Create a logical replication slot for change capture
+SELECT pg_create_logical_replication_slot('vibe_audit_slot', 'test_decoding');
+```
+
+---
+
+## Forwarder Setup
+
+The Rust sidecar receives UDP events from the extension and WAL changes from logical decoding, then persists, chains, and forwards them.
 
 ```bash
 cd forwarder/
 cargo build --release
-./target/release/vibe-audit-forwarder
-```
 
-Or with environment variables:
-
-```bash
 VIBE_AUDIT_UDP_PORT=5514 \
-VIBE_AUDIT_DB_URL=postgresql://postgres:postgres@localhost:5432/vibesql \
+VIBE_AUDIT_DB_URL="postgresql://postgres:postgres@localhost:5432/vibesql" \
 VIBE_AUDIT_GELF_HOST=127.0.0.1 \
 VIBE_AUDIT_GELF_PORT=12201 \
 VIBE_AUDIT_HEALTH_PORT=9100 \
+VIBE_AUDIT_WAL_ENABLED=true \
 ./target/release/vibe-audit-forwarder
-```
-
-### 5. Verify
-
-```bash
-# Check health
-curl http://localhost:9100/health
-
-# Verify hash chain integrity
-psql -c "SELECT * FROM vibe_audit.verify_chain();"
 ```
 
 ### Docker Compose (Full Stack)
@@ -125,119 +130,160 @@ cd deploy/
 docker-compose up
 ```
 
-Starts PostgreSQL (with extension), the Rust forwarder, and Graylog.
+Starts PostgreSQL (with extension + logical replication), the Rust forwarder, and Graylog.
+
+### Verify
+
+```bash
+# Forwarder health (event counts, WAL LSN position)
+curl http://localhost:9100/health
+
+# Hash chain integrity
+psql -c "SELECT * FROM vibe_audit.verify_chain();"
+```
 
 ---
 
 ## Event Types
 
-| Event Type | Hook | Captures |
-|------------|------|----------|
-| `AUTH_SUCCESS` | ClientAuthentication | Successful login (user, IP, database) |
-| `AUTH_FAIL` | ClientAuthentication | Failed login attempt (user, IP, reason) |
-| `DDL` | ProcessUtility | CREATE, DROP, ALTER statements |
-| `GRANT` / `REVOKE` | ProcessUtility | Privilege changes |
-| `DML` | ExecutorEnd | SELECT/INSERT/UPDATE/DELETE (superuser sessions, Phase 1) |
-| `SYSTEM_EVENT` | Forwarder | Heartbeat (every 10s) |
+| Event Type | Source | Captures |
+|------------|--------|----------|
+| `AUTH_SUCCESS` | ClientAuthentication_hook | Successful login (user, IP, database) |
+| `AUTH_FAIL` | ClientAuthentication_hook | Failed login attempt (user, IP, reason) |
+| `DDL` | ProcessUtility_hook | CREATE, DROP, ALTER statements |
+| `GRANT` / `REVOKE` | ProcessUtility_hook | Privilege changes |
+| `DML` | ExecutorEnd_hook | SELECT/INSERT/UPDATE/DELETE on sensitive tables |
+| `DML_CHANGE` | WAL logical decoding | Full before/after JSONB diff on tagged tables |
+| `SYSTEM_EVENT` | Forwarder | Heartbeat canary (every 10s) |
 
 ---
 
-## Hash Chain Verification
+## Sensitive Data Tracking
 
-```sql
-SELECT * FROM vibe_audit.verify_chain();
-```
-
-Returns:
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `checked_count` | bigint | Number of events verified |
-| `valid` | boolean | Chain integrity status |
-| `first_broken_id` | bigint | ID of first tampered event (null if valid) |
-
----
-
-## Sensitive Table Tagging (Phase 3)
+### Tag Tables for Audit
 
 ```sql
 INSERT INTO vibe_audit.sensitive_tables (schema_name, table_name, sensitivity)
 VALUES ('public', 'payment_cards', 'pci');
 ```
 
-Phase 3 will replace the superuser-only DML filter with per-table audit filtering based on tagged sensitivity levels.
+### Tag JSONB Fields
+
+Track specific fields inside JSONB columns. Fields marked `redact_in_log = true` are captured for change detection but redacted in log output.
+
+```sql
+INSERT INTO vibe_audit.sensitive_fields (schema_name, table_name, json_path, redact_in_log, description)
+VALUES
+  ('public', 'payment_cards', '$.card_number', true, 'PAN — log change events but redact value'),
+  ('public', 'payment_cards', '$.cardholder_name', true, 'Cardholder name'),
+  ('public', 'payment_cards', '$.status', false, 'Card status — log full value');
+```
+
+The forwarder refreshes the sensitive field registry every 5 minutes and applies JSONB diffing to WAL changes on tagged tables.
 
 ---
 
-## PCI DSS SAQ-D Compliance Matrix
+## Hash Chain
 
-| Requirement | Description | Coverage |
-|-------------|-------------|----------|
-| **10.2.1** | Audit trails for individual user access to cardholder data | DML hook (Phase 3: tagged tables) |
-| **10.2.2** | Actions by any individual with root/admin privileges | ExecutorEnd hook (superuser sessions) |
-| **10.2.4** | Invalid logical access attempts | AUTH_FAIL events |
-| **10.2.5** | Identification and authentication mechanism changes | DDL hook (CREATE/ALTER/DROP ROLE, GRANT, REVOKE) |
-| **10.2.6** | Initialization, stopping, or pausing of audit logs | SYSTEM_EVENT heartbeat, extension enable/disable |
-| **10.2.7** | Creation and deletion of system-level objects | DDL hook (CREATE/DROP TABLE, INDEX, etc.) |
-| **10.3.1** | User identification in audit trail | `session_user` field on all events |
+Every event includes `prev_hash` and `event_hash`:
+
+```
+hash_n = SHA256(hash_{n-1} || event_type || timestamp || session_user || database || command_tag || query_text)
+```
+
+Tampering with any event breaks the chain. Verify integrity:
+
+```sql
+SELECT * FROM vibe_audit.verify_chain();
+```
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `checked_count` | bigint | Events verified |
+| `valid` | boolean | Chain integrity status |
+| `first_broken_id` | bigint | First tampered event (null if valid) |
+
+---
+
+## PCI DSS v4.0 Compliance Matrix
+
+| Requirement | Description | Implementation |
+|-------------|-------------|----------------|
+| **10.2.1.1** | Individual user access to cardholder data | WAL capture + sensitive table tagging + JSONB diffing |
+| **10.2.1.2** | Actions by privileged users | ExecutorEnd_hook on superuser sessions |
+| **10.2.1.4** | Invalid logical access attempts | AUTH_FAIL events via ClientAuthentication_hook |
+| **10.2.1.5** | Changes to identification/authentication mechanisms | ProcessUtility_hook (CREATE/ALTER/DROP ROLE, GRANT, REVOKE) |
+| **10.2.1.6** | Initialization, stopping, or pausing of audit logs | SYSTEM_EVENT heartbeat, `vibe_audit.enabled` GUC tracking |
+| **10.2.1.7** | Creation and deletion of system-level objects | ProcessUtility_hook (DDL) |
+| **10.3.1** | User identification | `session_user` field on all events |
 | **10.3.2** | Type of event | `event_type` + `command_tag` fields |
 | **10.3.3** | Date and time | `event_time` (ISO 8601, millisecond precision) |
-| **10.3.4** | Success or failure indication | `success` boolean field |
+| **10.3.4** | Success or failure indication | `success` boolean + SHA-256 hash chain for tamper detection |
 | **10.3.5** | Origination of event | `client_addr` + `client_port` + `application` |
-| **10.3.6** | Identity or name of affected data/component | `object_type` + `object_name` + `schema_name` |
-| **10.5.1** | Limit viewing of audit trails | PostgreSQL role-based access on `vibe_audit` schema |
-| **10.5.2** | Protect audit trail files from unauthorized modification | Append-only (REVOKE UPDATE/DELETE), SHA-256 hash chain |
-| **10.5.5** | Use file-integrity monitoring or change-detection | `vibe_audit.verify_chain()` — hash chain verification |
-| **10.7** | Retain audit trail history for at least one year | Monthly partitions, configurable retention |
+| **10.3.6** | Affected data/system component | `object_type` + `object_name` + `schema_name` |
+| **10.5.1** | Restrict audit trail access | PostgreSQL RBAC on `vibe_audit` schema |
+| **10.5.1.2** | Protect from unauthorized modification | Append-only (REVOKE UPDATE/DELETE) + SHA-256 hash chain |
+| **10.7.1** | Retain at least 12 months | Monthly partitions, configurable retention policy |
 
 ---
 
-## Deployment Topology
+## Configuration Reference
 
-```
-┌────────────────────────────────────────┐
-│  Application Server                    │
-│                                        │
-│  ┌──────────────┐  ┌────────────────┐  │
-│  │ PostgreSQL   │  │ Forwarder      │  │
-│  │              │  │ (Rust sidecar) │  │
-│  │  vibe_audit  │──│                │  │
-│  │  extension   │  │  UDP:5514      │  │
-│  │              │  │  HTTP:9100     │──┼──▶ Monitoring
-│  └──────┬───────┘  └───────┬────────┘  │
-│         │                  │           │
-│         │                  │ GELF UDP  │
-│         ▼                  ▼           │
-│  ┌──────────────┐  ┌────────────────┐  │
-│  │ vibe_audit.  │  │ Graylog / SIEM │  │
-│  │ events table │  │                │  │
-│  │ (append-only)│  │ Dashboards     │  │
-│  │ (partitioned)│  │ Alerts         │  │
-│  └──────────────┘  └────────────────┘  │
-└────────────────────────────────────────┘
-```
-
----
-
-## Configuration
-
-### Extension (postgresql.conf)
+### Extension GUCs (postgresql.conf)
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `vibe_audit.enabled` | `on` | Enable/disable audit logging |
 | `vibe_audit.udp_port` | `5514` | UDP port for event emission |
-| `vibe_audit.udp_host` | `127.0.0.1` | UDP host for event emission |
+| `vibe_audit.udp_host` | `127.0.0.1` | UDP host (loopback only) |
+| `vibe_audit.executor_mode` | `emit` | `emit` = full audit, `counter` = count only, `off` = disable DML hooks |
 
-### Forwarder (environment variables)
+### Forwarder Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `VIBE_AUDIT_UDP_PORT` | `5514` | UDP listen port |
-| `VIBE_AUDIT_DB_URL` | `postgresql://postgres:postgres@127.0.0.1:5432/vibesql` | PostgreSQL connection |
+| `VIBE_AUDIT_DB_URL` | `postgresql://...@127.0.0.1:5432/vibesql` | PostgreSQL connection string |
 | `VIBE_AUDIT_GELF_HOST` | `127.0.0.1` | Graylog GELF host |
 | `VIBE_AUDIT_GELF_PORT` | `12201` | Graylog GELF port |
 | `VIBE_AUDIT_HEALTH_PORT` | `9100` | Health endpoint port |
+| `VIBE_AUDIT_WAL_ENABLED` | `false` | Enable WAL logical decoding capture |
+
+---
+
+## Repository Structure
+
+```
+vibesql-audit/
+├── ext/                          # PostgreSQL C extension
+│   ├── vibe_audit.c              # Entry point, GUC registration
+│   ├── vibe_hooks.c              # Auth, ProcessUtility, ExecutorEnd hooks
+│   ├── vibe_emit.c               # UDP emission (non-blocking sendto)
+│   ├── vibe_tags.c               # Sensitive table/field tag lookups
+│   ├── vibe_compat.h             # PG version compatibility guards
+│   ├── vibe_audit.control        # Extension metadata
+│   ├── vibe_audit--1.0.sql       # Initial schema
+│   ├── vibe_audit--1.0--1.1.sql  # Migration (adds sensitive_fields)
+│   ├── vibe_audit--1.1.sql       # Full v1.1 schema
+│   └── Makefile                  # PGXS build
+├── forwarder/                    # Rust sidecar
+│   ├── Cargo.toml
+│   └── src/                      # Hash chain, batch insert, WAL, GELF, health
+├── ci/                           # CI Dockerfiles (PG 15, 16, 17)
+├── deploy/                       # Docker Compose stack
+├── test/                         # Test suite
+└── LICENSE                       # Apache 2.0
+```
+
+---
+
+## Performance
+
+Target: **< 3% overhead** on non-tagged tables, **< 8%** on sensitive tables with WAL capture.
+
+The C extension uses non-blocking UDP `sendto()` on loopback. If the forwarder is unavailable, events are silently dropped — the database transaction is never blocked. After 10 consecutive failures, the extension falls back to `elog(LOG)`.
+
+WAL capture polls `pg_logical_slot_get_changes()` every 200ms. No impact on write transactions.
 
 ---
 
