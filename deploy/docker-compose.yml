@@ -1,0 +1,58 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: vibesql
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./ext-install:/docker-entrypoint-initdb.d
+      - pgdata:/var/lib/postgresql/data
+    command: >
+      postgres
+        -c shared_preload_libraries=vibe_audit
+        -c vibe_audit.enabled=on
+        -c vibe_audit.udp_port=5514
+        -c vibe_audit.udp_host=127.0.0.1
+
+  forwarder:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.forwarder
+    environment:
+      VIBE_AUDIT_UDP_PORT: "5514"
+      VIBE_AUDIT_DB_URL: "postgresql://postgres:postgres@postgres:5432/vibesql"
+      VIBE_AUDIT_GELF_HOST: "graylog"
+      VIBE_AUDIT_GELF_PORT: "12201"
+      VIBE_AUDIT_HEALTH_PORT: "9100"
+    ports:
+      - "9100:9100"
+    depends_on:
+      - postgres
+    network_mode: "service:postgres"
+
+  graylog:
+    image: graylog/graylog:6.1
+    environment:
+      GRAYLOG_PASSWORD_SECRET: somepasswordpepper
+      GRAYLOG_ROOT_PASSWORD_SHA2: 8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918
+      GRAYLOG_HTTP_BIND_ADDRESS: "0.0.0.0:9000"
+    ports:
+      - "9000:9000"
+      - "12201:12201/udp"
+    depends_on:
+      - mongo
+      - opensearch
+
+  mongo:
+    image: mongo:7.0
+
+  opensearch:
+    image: opensearchproject/opensearch:2
+    environment:
+      - discovery.type=single-node
+      - plugins.security.disabled=true
+
+volumes:
+  pgdata:

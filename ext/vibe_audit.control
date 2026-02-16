@@ -1,0 +1,5 @@
+comment = 'VibeSQL Audit — PCI DSS compliant audit logging for PostgreSQL'
+default_version = '1.0'
+module_pathname = '$libdir/vibe_audit'
+relocatable = false
+schema = vibe_audit

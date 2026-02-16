@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  build-extension:
+    strategy:
+      matrix:
+        pg_version: [15, 16, 17]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build extension (PG ${{ matrix.pg_version }})
+        run: |
+          docker build -f ci/pg${{ matrix.pg_version }}.dockerfile -t vibe-audit-pg${{ matrix.pg_version }} .
+
+      - name: Run regression tests
+        run: |
+          docker run --rm \
+            -e POSTGRES_PASSWORD=postgres \
+            vibe-audit-pg${{ matrix.pg_version }} \
+            bash -c "
+              pg_ctlcluster ${{ matrix.pg_version }} main start &&
+              psql -U postgres -c 'CREATE EXTENSION vibe_audit;' &&
+              psql -U postgres -c 'SELECT vibe_audit.ensure_partition(CURRENT_DATE);' &&
+              psql -U postgres -c \"SELECT * FROM vibe_audit.verify_chain();\"
+            "
+
+  build-forwarder:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build forwarder
+        working-directory: forwarder
+        run: cargo build --release
+
+      - name: Run tests
+        working-directory: forwarder
+        run: cargo test

@@ -1,0 +1,19 @@
+# C extension build artifacts
+ext/*.o
+ext/*.so
+ext/*.dylib
+ext/*.dll
+
+# Rust
+forwarder/target/
+forwarder/Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
