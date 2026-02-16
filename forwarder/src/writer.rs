@@ -8,6 +8,10 @@ pub struct BatchWriter {
 }
 
 impl BatchWriter {
+    pub fn pool(&self) -> &Pool {
+        &self.pool
+    }
+
     pub async fn new(db_url: &str) -> Self {
         let mut cfg = Config::new();
         cfg.url = Some(db_url.to_string());

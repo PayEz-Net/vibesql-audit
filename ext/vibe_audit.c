@@ -5,6 +5,7 @@ PG_MODULE_MAGIC;
 bool vibe_audit_enabled = true;
 int vibe_audit_udp_port = 5514;
 char *vibe_audit_udp_host = NULL;
+char *vibe_audit_executor_mode = NULL;
 
 vibe_socket_t vibe_udp_socket = VIBE_INVALID_SOCKET;
 struct sockaddr_in vibe_udp_addr;
@@ -57,6 +58,17 @@ _PG_init(void)
         NULL, NULL, NULL
     );
 
+    DefineCustomStringVariable(
+        "vibe_audit.executor_mode",
+        "ExecutorEnd hook behavior: counter (access counting only), emit (full event emission), off (disabled)",
+        NULL,
+        &vibe_audit_executor_mode,
+        "counter",
+        PGC_SIGHUP,
+        0,
+        NULL, NULL, NULL
+    );
+
     MarkGUCPrefixReserved("vibe_audit");
 
     vibe_init_socket();
@@ -70,7 +82,8 @@ _PG_init(void)
     prev_executor_end_hook = ExecutorEnd_hook;
     ExecutorEnd_hook = vibe_executor_end_hook;
 
-    elog(LOG, "vibe_audit: extension loaded (udp=%s:%d)", vibe_audit_udp_host, vibe_audit_udp_port);
+    elog(LOG, "vibe_audit: extension loaded (udp=%s:%d, executor_mode=%s)",
+         vibe_audit_udp_host, vibe_audit_udp_port, vibe_audit_executor_mode);
 }
 
 void
@@ -143,7 +156,10 @@ vibe_process_utility_hook(VIBE_UTILITY_HOOK_ARGS)
 static void
 vibe_executor_end_hook(QueryDesc *queryDesc)
 {
-    if (vibe_audit_enabled && superuser())
+    if (vibe_audit_enabled &&
+        vibe_audit_executor_mode &&
+        strcmp(vibe_audit_executor_mode, "emit") == 0 &&
+        superuser())
         vibe_emit_executor_event(queryDesc);
 
     if (prev_executor_end_hook)

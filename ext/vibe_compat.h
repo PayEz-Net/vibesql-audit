@@ -70,6 +70,7 @@ extern int vibe_udp_consecutive_failures;
 extern bool vibe_audit_enabled;
 extern int vibe_audit_udp_port;
 extern char *vibe_audit_udp_host;
+extern char *vibe_audit_executor_mode;
 
 extern void vibe_emit_event(const char *json, int len);
 extern void vibe_emit_auth_event(Port *port, int status);

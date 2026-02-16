@@ -15,12 +15,25 @@ pub struct HealthData {
     pub last_event_time: Option<String>,
 }
 
+#[derive(Clone)]
+struct AppState {
+    health: HealthState,
+    wal_enabled: bool,
+    wal_event_count: Arc<std::sync::atomic::AtomicU64>,
+    udp_event_count: Arc<std::sync::atomic::AtomicU64>,
+    wal_lsn: Arc<tokio::sync::RwLock<String>>,
+}
+
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
     events_processed: u64,
     chain_length: u64,
     last_event_time: Option<String>,
+    wal_enabled: bool,
+    wal_lsn: String,
+    wal_events: u64,
+    udp_events: u64,
 }
 
 impl HealthState {
@@ -42,10 +55,25 @@ impl HealthState {
     }
 }
 
-pub async fn run(port: u16, state: HealthState) {
+pub async fn run(
+    port: u16,
+    state: HealthState,
+    wal_enabled: bool,
+    wal_event_count: Arc<std::sync::atomic::AtomicU64>,
+    udp_event_count: Arc<std::sync::atomic::AtomicU64>,
+    wal_lsn: Arc<tokio::sync::RwLock<String>>,
+) {
+    let app_state = AppState {
+        health: state,
+        wal_enabled,
+        wal_event_count,
+        udp_event_count,
+        wal_lsn,
+    };
+
     let app = Router::new()
         .route("/health", get(health_handler))
-        .with_state(state);
+        .with_state(app_state);
 
     let addr = format!("0.0.0.0:{}", port);
     let listener = TcpListener::bind(&addr)
@@ -59,13 +87,22 @@ pub async fn run(port: u16, state: HealthState) {
         .expect("health server failed");
 }
 
-async fn health_handler(State(state): State<HealthState>) -> Json<HealthResponse> {
-    let data = state.inner.lock().unwrap();
+async fn health_handler(State(state): State<AppState>) -> Json<HealthResponse> {
+    let (events_processed, chain_length, last_event_time) = {
+        let data = state.health.inner.lock().unwrap();
+        (data.events_processed, data.chain_length, data.last_event_time.clone())
+    };
+    let lsn = state.wal_lsn.read().await.clone();
+
     Json(HealthResponse {
         status: "ok",
-        events_processed: data.events_processed,
-        chain_length: data.chain_length,
-        last_event_time: data.last_event_time.clone(),
+        events_processed,
+        chain_length,
+        last_event_time,
+        wal_enabled: state.wal_enabled,
+        wal_lsn: lsn,
+        wal_events: state.wal_event_count.load(std::sync::atomic::Ordering::Relaxed),
+        udp_events: state.udp_event_count.load(std::sync::atomic::Ordering::Relaxed),
     })
 }
 
